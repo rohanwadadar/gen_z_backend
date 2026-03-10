@@ -279,13 +279,27 @@ io.on('connection', (socket) => {
     socket.on('typing_start', ({ room_id, email }) => socket.to(room_id).emit('peer_typing', { email }));
     socket.on('typing_stop', ({ room_id }) => socket.to(room_id).emit('peer_stopped_typing'));
 
-    // 13. User status/mood
+    // 13. Appear Offline / Online (ghost mode — socket stays connected, peer sees you as offline)
+    socket.on('appear_offline', ({ email }) => {
+        onlineUsers.delete(email);
+        lastSeen.set(email, new Date());
+        broadcastStatusToRoommates(email, false);
+        console.log('[APPEAR OFFLINE]', email);
+    });
+    socket.on('appear_online', ({ email }) => {
+        onlineUsers.set(email, socket.id);
+        lastSeen.delete(email);
+        broadcastStatusToRoommates(email, true);
+        console.log('[APPEAR ONLINE]', email);
+    });
+
+    // 14. User status/mood
     socket.on('set_status', ({ email, emoji, text }) => {
         userStatus.set(email, { emoji, text });
         broadcastStatusToRoommates(email, true);
     });
 
-    // 14. Disconnect
+    // 15. Disconnect
     socket.on('disconnect', () => {
         if (socket.data.email) {
             const email = socket.data.email;
