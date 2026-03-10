@@ -9,97 +9,94 @@ require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'nexus-dev-secret-change-in-prod';
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
 const allowedOrigins = [
-    'http://localhost:5173',
-    'http://localhost:5174',
+    'http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175',
+    'https://gen-z-frontend-theta.vercel.app',
     process.env.FRONTEND_URL,
 ].filter(Boolean);
 
 const app = express();
 app.use(cors({ origin: allowedOrigins, credentials: true }));
-app.use(express.json({ limit: '10mb' }));  // Allow larger body for base64 images
+app.use(express.json({ limit: '10mb' }));
 
-// ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Nexus Chat API v2' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'z-talk API v3' }));
 
-// ──────────────────────────────────────────────────────────────────────────────
-//  AUTH ENDPOINTS
-// ──────────────────────────────────────────────────────────────────────────────
-
-// Register
+// ── AUTH ───────────────────────────────────────────────────────────────────────
 app.post('/api/register', async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password)
-        return res.status(400).json({ error: 'Email and password are required.' });
-    if (password.length < 6)
-        return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+    if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
     try {
         const existing = await db.query('SELECT email FROM users WHERE email=$1', [email.toLowerCase()]);
-        if (existing.rows.length)
-            return res.status(409).json({ error: 'This email is already registered.' });
+        if (existing.rows.length) return res.status(409).json({ error: 'This email is already registered.' });
         const hash = await bcrypt.hash(password, 12);
         await db.query('INSERT INTO users (email, password_hash) VALUES ($1,$2)', [email.toLowerCase(), hash]);
         const token = jwt.sign({ email: email.toLowerCase() }, JWT_SECRET, { expiresIn: '30d' });
         res.status(201).json({ token, email: email.toLowerCase() });
-    } catch (err) {
-        console.error('register:', err);
-        res.status(500).json({ error: 'Server error. Please try again.' });
-    }
+    } catch (err) { console.error('register:', err); res.status(500).json({ error: 'Server error.' }); }
 });
 
-// Login
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password)
-        return res.status(400).json({ error: 'Email and password are required.' });
+    if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
     try {
         const result = await db.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase()]);
-        if (!result.rows.length)
-            return res.status(401).json({ error: 'Invalid email or password.' });
+        if (!result.rows.length) return res.status(401).json({ error: 'Invalid email or password.' });
         const valid = await bcrypt.compare(password, result.rows[0].password_hash);
-        if (!valid)
-            return res.status(401).json({ error: 'Invalid email or password.' });
+        if (!valid) return res.status(401).json({ error: 'Invalid email or password.' });
         const token = jwt.sign({ email: email.toLowerCase() }, JWT_SECRET, { expiresIn: '30d' });
         res.json({ token, email: email.toLowerCase() });
-    } catch (err) {
-        console.error('login:', err);
-        res.status(500).json({ error: 'Server error. Please try again.' });
-    }
+    } catch (err) { console.error('login:', err); res.status(500).json({ error: 'Server error.' }); }
 });
 
-// Verify token (used on page refresh to auto-login)
 app.get('/api/verify', (req, res) => {
     const auth = req.headers.authorization;
-    if (!auth?.startsWith('Bearer '))
-        return res.status(401).json({ error: 'No token provided.' });
+    if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No token provided.' });
     try {
         const payload = jwt.verify(auth.slice(7), JWT_SECRET);
         res.json({ email: payload.email });
-    } catch {
-        res.status(401).json({ error: 'Token expired or invalid.' });
-    }
+    } catch { res.status(401).json({ error: 'Token expired or invalid.' }); }
 });
 
-// ─── HTTP Server + Socket.io ──────────────────────────────────────────────────
+// ── Server + Socket.io ─────────────────────────────────────────────────────────
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: allowedOrigins, methods: ['GET', 'POST'], credentials: true },
-    maxHttpBufferSize: 10e6,   // 10 MB — needed for image relay
+    maxHttpBufferSize: 10e6,
 });
 
-// ─── In-memory: email → socketId ──────────────────────────────────────────────
-const onlineUsers = new Map();
+// ── In-memory stores ───────────────────────────────────────────────────────────
+const onlineUsers = new Map();   // email → socketId
+const lastSeen = new Map();   // email → Date
+const userStatus = new Map();   // email → { emoji, text }
+// reactions: Map<message_id, Map<emoji, Set<email>>>
+const reactions = new Map();
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 const generateId = (email) => `${email}${Date.now()}${Math.floor(1000 + Math.random() * 9000)}`;
 const makeRoomId = (a, b) => [a, b].sort().join('::');
-const emitToUser = (email, event, data) => {
-    const sid = onlineUsers.get(email);
-    if (sid) io.to(sid).emit(event, data);
+const emitToUser = (email, event, data) => { const sid = onlineUsers.get(email); if (sid) io.to(sid).emit(event, data); };
+
+const broadcastStatusToRoommates = async (email, isOnline) => {
+    try {
+        const res = await db.query(
+            `SELECT requester_email, recipient_email FROM chat_requests WHERE (requester_email=$1 OR recipient_email=$1) AND status='accepted'`,
+            [email]
+        );
+        const payload = {
+            email,
+            online: isOnline,
+            lastSeen: lastSeen.get(email) || null,
+            status: userStatus.get(email) || null,
+        };
+        res.rows.forEach(row => {
+            const peer = row.requester_email === email ? row.recipient_email : row.requester_email;
+            emitToUser(peer, 'peer_status_update', payload);
+        });
+    } catch (err) { console.error('broadcastStatus:', err); }
 };
 
-// ─── Socket.io ─────────────────────────────────────────────────────────────────
+// ── Socket.io ──────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
     console.log('Socket connected:', socket.id);
 
@@ -107,16 +104,28 @@ io.on('connection', (socket) => {
     socket.on('user_online', async ({ email }) => {
         onlineUsers.set(email, socket.id);
         socket.data.email = email;
+        broadcastStatusToRoommates(email, true);
         try {
             const [incoming, accepted, outgoing] = await Promise.all([
                 db.query(`SELECT * FROM chat_requests WHERE recipient_email=$1 AND status='pending' ORDER BY created_at DESC`, [email]),
                 db.query(`SELECT * FROM chat_requests WHERE (requester_email=$1 OR recipient_email=$1) AND status='accepted' ORDER BY created_at DESC`, [email]),
                 db.query(`SELECT * FROM chat_requests WHERE requester_email=$1 AND status='pending' ORDER BY created_at DESC`, [email]),
             ]);
+            // Build online status map for accepted peers
+            const onlineMap = {};
+            accepted.rows.forEach(row => {
+                const peer = row.requester_email === email ? row.recipient_email : row.requester_email;
+                onlineMap[peer] = {
+                    online: onlineUsers.has(peer),
+                    lastSeen: lastSeen.get(peer) || null,
+                    status: userStatus.get(peer) || null,
+                };
+            });
             socket.emit('dashboard_data', {
                 incomingRequests: incoming.rows,
                 acceptedChats: accepted.rows,
                 outgoingRequests: outgoing.rows,
+                onlineMap,
             });
         } catch (err) { console.error('user_online:', err); }
     });
@@ -132,26 +141,20 @@ io.on('connection', (socket) => {
             );
             if (ex.rows.length) {
                 const r = ex.rows[0];
-                if (r.status === 'accepted') return socket.emit('request_error', { message: 'You already have an active chat with this person.' });
+                if (r.status === 'accepted') return socket.emit('request_error', { message: 'Already have an active chat with this person.' });
                 if (r.status === 'pending') return socket.emit('request_error', { message: 'A request is already pending.' });
                 if (r.status === 'rejected') await db.query(`DELETE FROM chat_requests WHERE id=$1`, [r.id]);
             }
             const id = generateId(requester_email);
             const req = { id, requester_email, recipient_email, status: 'pending', created_at: new Date() };
-            await db.query(
-                `INSERT INTO chat_requests (id,requester_email,recipient_email,status) VALUES ($1,$2,$3,'pending')`,
-                [id, requester_email, recipient_email]
-            );
+            await db.query(`INSERT INTO chat_requests (id,requester_email,recipient_email,status) VALUES ($1,$2,$3,'pending')`, [id, requester_email, recipient_email]);
             emitToUser(recipient_email, 'incoming_chat_request', req);
             socket.emit('request_sent', req);
-        } catch (err) {
-            console.error('send_chat_request:', err);
-            socket.emit('request_error', { message: 'Failed to send request.' });
-        }
+        } catch (err) { console.error('send_chat_request:', err); socket.emit('request_error', { message: 'Failed to send request.' }); }
     });
 
     // 3. Accept request
-    socket.on('accept_chat_request', async ({ request_id, acceptor_email }) => {
+    socket.on('accept_chat_request', async ({ request_id }) => {
         try {
             const res = await db.query(`SELECT * FROM chat_requests WHERE id=$1`, [request_id]);
             if (!res.rows.length) return;
@@ -172,7 +175,6 @@ io.on('connection', (socket) => {
             const req = res.rows[0];
             await db.query(`UPDATE chat_requests SET status='rejected' WHERE id=$1`, [request_id]);
             emitToUser(req.requester_email, 'chat_request_rejected', { request_id });
-            emitToUser(req.recipient_email, 'request_removed', { request_id });
         } catch (err) { console.error('reject:', err); }
     });
 
@@ -185,6 +187,7 @@ io.on('connection', (socket) => {
             const peer = req.requester_email === deleter_email ? req.recipient_email : req.requester_email;
             await db.query(`DELETE FROM messages WHERE room_id=$1`, [room_id]);
             await db.query(`DELETE FROM chat_requests WHERE id=$1`, [request_id]);
+            reactions.forEach((_, key) => { if (key.includes(room_id)) reactions.delete(key); });
             emitToUser(deleter_email, 'conversation_deleted', { request_id });
             emitToUser(peer, 'conversation_deleted', { request_id });
         } catch (err) { console.error('delete_conversation:', err); }
@@ -193,19 +196,37 @@ io.on('connection', (socket) => {
     // 6. Join room
     socket.on('join_room', async ({ email, room_id }) => {
         socket.join(room_id);
+        // Notify others in room so they can show 'Delivered' tick
+        socket.to(room_id).emit('peer_joined_room', { email });
         try {
-            const res = await db.query(
-                `SELECT * FROM messages WHERE room_id=$1 ORDER BY created_at ASC LIMIT 100`,
-                [room_id]
+            const res = await db.query(`SELECT * FROM messages WHERE room_id=$1 ORDER BY created_at ASC LIMIT 150`, [room_id]);
+            // Attach reactions to each message
+            const msgs = res.rows.map(m => ({
+                ...m,
+                reactions: getReactionSummary(m.id),
+            }));
+            socket.emit('previous_messages', msgs);
+            // Emit peer online status
+            const peerRes = await db.query(
+                `SELECT requester_email, recipient_email FROM chat_requests WHERE room_id=$1`, [room_id]
             );
-            socket.emit('previous_messages', res.rows);
+            if (peerRes.rows.length) {
+                const row = peerRes.rows[0];
+                const peer = row.requester_email === email ? row.recipient_email : row.requester_email;
+                socket.emit('peer_status_update', {
+                    email: peer,
+                    online: onlineUsers.has(peer),
+                    lastSeen: lastSeen.get(peer) || null,
+                    status: userStatus.get(peer) || null,
+                });
+            }
         } catch (err) { console.error('join_room:', err); }
     });
 
-    // 7. Send text message (persisted)
-    socket.on('send_message', async ({ sender_email, message_content, room_id }) => {
+    // 7. Send message (with optional reply_to)
+    socket.on('send_message', async ({ sender_email, message_content, room_id, reply_to }) => {
         const id = generateId(sender_email);
-        const msg = { id, sender_email, message_content, room_id, created_at: new Date() };
+        const msg = { id, sender_email, message_content, room_id, reply_to: reply_to || null, created_at: new Date(), reactions: {} };
         try {
             await db.query(
                 `INSERT INTO messages (id,sender_email,message_content,room_id) VALUES ($1,$2,$3,$4)`,
@@ -215,41 +236,75 @@ io.on('connection', (socket) => {
         } catch (err) { console.error('send_message:', err); }
     });
 
-    // 8. Send image (NOT persisted — relayed only, ephemeral)
+    // 8. Send image (ephemeral)
     socket.on('send_image', ({ sender_email, image_data, room_id }) => {
         const id = generateId(sender_email);
-        const msg = {
-            id,
-            sender_email,
-            message_content: `__IMG__${image_data}`,  // special prefix for frontend to detect
-            room_id,
-            created_at: new Date(),
-            ephemeral: true,  // not saved to DB
-        };
-        // Relay to everyone in the room (including sender for confirmation)
+        const msg = { id, sender_email, message_content: `__IMG__${image_data}`, room_id, created_at: new Date(), ephemeral: true, reactions: {} };
         io.to(room_id).emit('receive_message', msg);
     });
 
-    // 9. Delete message (author only)
+    // 9. Delete message
     socket.on('delete_message', async ({ message_id, room_id, sender_email }) => {
         try {
             await db.query(`DELETE FROM messages WHERE id=$1 AND sender_email=$2`, [message_id, sender_email]);
+            reactions.delete(message_id);
             io.to(room_id).emit('message_deleted', { message_id });
         } catch (err) { console.error('delete_message:', err); }
     });
 
-    // 10. Typing indicators
+    // 10. React to message
+    socket.on('react_message', ({ message_id, emoji, email, room_id }) => {
+        if (!reactions.has(message_id)) reactions.set(message_id, new Map());
+        const msgReactions = reactions.get(message_id);
+        if (!msgReactions.has(emoji)) msgReactions.set(emoji, new Set());
+        const users = msgReactions.get(emoji);
+        if (users.has(email)) {
+            users.delete(email);          // toggle off
+            if (users.size === 0) msgReactions.delete(emoji);
+        } else {
+            users.add(email);             // toggle on
+        }
+        io.to(room_id).emit('reaction_updated', {
+            message_id,
+            reactions: getReactionSummary(message_id),
+        });
+    });
+
+    // 11. Mark messages as read
+    socket.on('mark_read', ({ room_id, email }) => {
+        socket.to(room_id).emit('messages_read', { by: email });
+    });
+
+    // 12. Typing indicators
     socket.on('typing_start', ({ room_id, email }) => socket.to(room_id).emit('peer_typing', { email }));
     socket.on('typing_stop', ({ room_id }) => socket.to(room_id).emit('peer_stopped_typing'));
 
-    // 11. Disconnect
+    // 13. User status/mood
+    socket.on('set_status', ({ email, emoji, text }) => {
+        userStatus.set(email, { emoji, text });
+        broadcastStatusToRoommates(email, true);
+    });
+
+    // 14. Disconnect
     socket.on('disconnect', () => {
         if (socket.data.email) {
-            onlineUsers.delete(socket.data.email);
-            console.log('[OFFLINE]', socket.data.email);
+            const email = socket.data.email;
+            onlineUsers.delete(email);
+            lastSeen.set(email, new Date());
+            broadcastStatusToRoommates(email, false);
+            console.log('[OFFLINE]', email);
         }
     });
 });
 
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function getReactionSummary(messageId) {
+    const msgReactions = reactions.get(messageId);
+    if (!msgReactions) return {};
+    const summary = {};
+    msgReactions.forEach((users, emoji) => { if (users.size > 0) summary[emoji] = users.size; });
+    return summary;
+}
+
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`✅ Nexus Chat Server on port ${PORT}`));
+server.listen(PORT, () => console.log(`✅ z-talk Server v3 on port ${PORT}`));
