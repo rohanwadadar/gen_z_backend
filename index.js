@@ -106,10 +106,11 @@ io.on('connection', (socket) => {
         socket.data.email = email;
         broadcastStatusToRoommates(email, true);
         try {
-            const [incoming, accepted, outgoing] = await Promise.all([
+            const [incoming, accepted, outgoing, groups] = await Promise.all([
                 db.query(`SELECT * FROM chat_requests WHERE recipient_email=$1 AND status='pending' ORDER BY created_at DESC`, [email]),
                 db.query(`SELECT * FROM chat_requests WHERE (requester_email=$1 OR recipient_email=$1) AND status='accepted' ORDER BY created_at DESC`, [email]),
                 db.query(`SELECT * FROM chat_requests WHERE requester_email=$1 AND status='pending' ORDER BY created_at DESC`, [email]),
+                db.query(`SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_email=$1`, [email]),
             ]);
             // Build online status map for accepted peers
             const onlineMap = {};
@@ -125,6 +126,7 @@ io.on('connection', (socket) => {
                 incomingRequests: incoming.rows,
                 acceptedChats: accepted.rows,
                 outgoingRequests: outgoing.rows,
+                joinedGroups: groups.rows,
                 onlineMap,
             });
         } catch (err) { console.error('user_online:', err); }
@@ -178,6 +180,45 @@ io.on('connection', (socket) => {
         } catch (err) { console.error('reject:', err); }
     });
 
+    // 4.5 Groups
+    socket.on('create_group', async ({ name, created_by }) => {
+        const id = 'group_' + generateId(created_by);
+        try {
+            await db.query('INSERT INTO groups (id, name, created_by) VALUES ($1, $2, $3)', [id, name, created_by]);
+            await db.query('INSERT INTO group_members (group_id, user_email, role) VALUES ($1, $2, $3)', [id, created_by, 'admin']);
+            socket.join(id);
+            socket.emit('group_created', { id, name, created_by });
+
+            // Refresh dashboard data for groups
+            const groups = await db.query(`SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_email=$1`, [created_by]);
+            socket.emit('joined_groups_update', groups.rows);
+        } catch (err) { console.error('create_group:', err); }
+    });
+
+    socket.on('invite_to_group', async ({ group_id, user_email, inviter_email }) => {
+        try {
+            await db.query('INSERT INTO group_members (group_id, user_email) VALUES ($1, $2) ON CONFLICT DO NOTHING', [group_id, user_email]);
+            const groupRes = await db.query('SELECT * FROM groups WHERE id=$1', [group_id]);
+            if (groupRes.rows.length) {
+                emitToUser(user_email, 'group_invite', { group: groupRes.rows[0], inviter_email });
+                // Send updated groups to the invited user
+                const groups = await db.query(`SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_email=$1`, [user_email]);
+                emitToUser(user_email, 'joined_groups_update', groups.rows);
+            }
+        } catch (err) { console.error('invite_to_group:', err); }
+    });
+
+
+    socket.on('leave_group', async ({ group_id, email }) => {
+        try {
+            await db.query('DELETE FROM group_members WHERE group_id=$1 AND user_email=$2', [group_id, email]);
+            socket.leave(group_id);
+            const groups = await db.query(`SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_email=$1`, [email]);
+            socket.emit('joined_groups_update', groups.rows);
+            // Optional: Broadcast to group that someone left
+        } catch (err) { console.error('leave_group:', err); }
+    });
+
     // 5. Delete conversation
     socket.on('delete_conversation', async ({ request_id, room_id, deleter_email }) => {
         try {
@@ -206,20 +247,27 @@ io.on('connection', (socket) => {
                 reactions: getReactionSummary(m.id),
             }));
             socket.emit('previous_messages', msgs);
-            // Emit peer online status
-            const peerRes = await db.query(
-                `SELECT requester_email, recipient_email FROM chat_requests WHERE room_id=$1`, [room_id]
-            );
-            if (peerRes.rows.length) {
-                const row = peerRes.rows[0];
-                const peer = row.requester_email === email ? row.recipient_email : row.requester_email;
-                socket.emit('peer_status_update', {
-                    email: peer,
-                    online: onlineUsers.has(peer),
-                    lastSeen: lastSeen.get(peer) || null,
-                    status: userStatus.get(peer) || null,
-                });
+            // Emit peer online status (only for 1v1 chats)
+            if (!room_id.startsWith('group_')) {
+                const peerRes = await db.query(
+                    `SELECT requester_email, recipient_email FROM chat_requests WHERE room_id=$1`, [room_id]
+                );
+                if (peerRes.rows.length) {
+                    const row = peerRes.rows[0];
+                    const peer = row.requester_email === email ? row.recipient_email : row.requester_email;
+                    socket.emit('peer_status_update', {
+                        email: peer,
+                        online: onlineUsers.has(peer),
+                        lastSeen: lastSeen.get(peer) || null,
+                        status: userStatus.get(peer) || null,
+                    });
+                }
+            } else {
+                // For groups, optionally fetch group members
+                const members = await db.query('SELECT user_email FROM group_members WHERE group_id=$1', [room_id]);
+                socket.emit('group_members', { group_id: room_id, members: members.rows });
             }
+
         } catch (err) { console.error('join_room:', err); }
     });
 
