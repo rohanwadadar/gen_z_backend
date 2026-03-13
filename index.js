@@ -106,12 +106,27 @@ io.on('connection', (socket) => {
         socket.data.email = email;
         broadcastStatusToRoommates(email, true);
         try {
-            const [incoming, accepted, outgoing, groups] = await Promise.all([
+            const [incoming, accepted, outgoing, groups, latestMsgs] = await Promise.all([
                 db.query(`SELECT * FROM chat_requests WHERE recipient_email=$1 AND status='pending' ORDER BY created_at DESC`, [email]),
                 db.query(`SELECT * FROM chat_requests WHERE (requester_email=$1 OR recipient_email=$1) AND status='accepted' ORDER BY created_at DESC`, [email]),
                 db.query(`SELECT * FROM chat_requests WHERE requester_email=$1 AND status='pending' ORDER BY created_at DESC`, [email]),
                 db.query(`SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_email=$1`, [email]),
+                db.query(`
+                    SELECT DISTINCT ON (room_id) id, room_id, message_content, created_at, sender_email 
+                    FROM messages 
+                    WHERE room_id IN (
+                        SELECT room_id FROM chat_requests WHERE status='accepted' AND (requester_email=$1 OR recipient_email=$1)
+                        UNION
+                        SELECT group_id FROM group_members WHERE user_email=$1
+                    )
+                    ORDER BY room_id, created_at DESC
+                `, [email]),
             ]);
+
+            // Auto-join all accepted rooms and groups to receive messages in background
+            accepted.rows.forEach(r => socket.join(r.room_id));
+            groups.rows.forEach(g => socket.join(g.id));
+
             // Build online status map for accepted peers
             const onlineMap = {};
             accepted.rows.forEach(row => {
@@ -127,6 +142,7 @@ io.on('connection', (socket) => {
                 acceptedChats: accepted.rows,
                 outgoingRequests: outgoing.rows,
                 joinedGroups: groups.rows,
+                latestMessages: latestMsgs ? latestMsgs.rows : [],
                 onlineMap,
             });
         } catch (err) { console.error('user_online:', err); }
